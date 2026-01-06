@@ -1,6 +1,5 @@
 package com.hotel.bookingservice.service;
 
-import com.hotel.bookingservice.client.HotelServiceClient;
 import com.hotel.bookingservice.dto.*;
 import com.hotel.bookingservice.entity.*;
 import com.hotel.bookingservice.exception.*;
@@ -30,7 +29,7 @@ class BookingServiceTest {
     private UserRepository userRepository;
 
     @Mock
-    private HotelServiceClient hotelServiceClient;
+    private HotelServiceCaller hotelServiceCaller;
 
     @Mock
     private BookingMapper bookingMapper;
@@ -134,7 +133,7 @@ class BookingServiceTest {
         // Then
         assertThat(result).isNotNull();
         verify(userRepository, never()).findById(anyLong());
-        verify(hotelServiceClient, never()).confirmAvailability(anyLong(), any());
+        verify(hotelServiceCaller, never()).confirmAvailability(anyLong(), any());
     }
 
     @Test
@@ -197,14 +196,14 @@ class BookingServiceTest {
 
         when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
         when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
-        when(hotelServiceClient.getRecommendedRooms(eq(1L), any(), any()))
+        when(hotelServiceCaller.getRecommendedRooms(eq(1L), any(), any()))
                 .thenReturn(Arrays.asList(recommendedRoom));
         when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
             Booking b = inv.getArgument(0);
             b.setId(1L);
             return b;
         });
-        when(hotelServiceClient.confirmAvailability(eq(2L), any())).thenReturn(availabilityResponse);
+        when(hotelServiceCaller.confirmAvailability(eq(2L), any())).thenReturn(availabilityResponse);
         when(bookingMapper.toDto(any(Booking.class))).thenReturn(testBookingDto);
 
         // When
@@ -212,7 +211,7 @@ class BookingServiceTest {
 
         // Then
         assertThat(result).isNotNull();
-        verify(hotelServiceClient).getRecommendedRooms(eq(1L), any(), any());
+        verify(hotelServiceCaller).getRecommendedRooms(eq(1L), any(), any());
     }
 
     @Test
@@ -227,7 +226,7 @@ class BookingServiceTest {
 
         when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
         when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
-        when(hotelServiceClient.getRecommendedRooms(eq(1L), any(), any()))
+        when(hotelServiceCaller.getRecommendedRooms(eq(1L), any(), any()))
                 .thenReturn(Collections.emptyList());
 
         // When/Then
@@ -248,7 +247,7 @@ class BookingServiceTest {
 
         // Then
         assertThat(testBooking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(hotelServiceClient).releaseRoom(eq(1L), any(ReleaseRoomRequest.class));
+        verify(hotelServiceCaller).releaseRoom(eq(1L), any(ReleaseRoomRequest.class));
         verify(bookingRepository).save(testBooking);
     }
 
@@ -262,7 +261,7 @@ class BookingServiceTest {
         bookingService.cancelBooking(1L, 1L);
 
         // Then
-        verify(hotelServiceClient, never()).releaseRoom(anyLong(), any());
+        verify(hotelServiceCaller, never()).releaseRoom(anyLong(), any());
         verify(bookingRepository, never()).save(any());
     }
 
@@ -274,5 +273,226 @@ class BookingServiceTest {
         // When/Then
         assertThatThrownBy(() -> bookingService.cancelBooking(999L, 1L))
                 .isInstanceOf(ResourceNotFoundException.class);
+    }
+
+    // ========== NEW TESTS FOR MISSING SCENARIOS ==========
+
+    @Test
+    void createBooking_WhenHotelServiceTimeout_ShouldCompensateAndThrow() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking b = inv.getArgument(0);
+            b.setId(1L);
+            return b;
+        });
+
+        // Simulate timeout by throwing HotelServiceException
+        when(hotelServiceCaller.confirmAvailability(eq(1L), any()))
+                .thenThrow(new HotelServiceException("Connection timeout", new RuntimeException()));
+
+        // When/Then
+        assertThatThrownBy(() -> bookingService.createBooking(1L, request))
+                .isInstanceOf(BookingException.class)
+                .hasMessageContaining("Failed to create booking");
+
+        // Verify compensation was attempted
+        verify(hotelServiceCaller).releaseRoom(eq(1L), any(ReleaseRoomRequest.class));
+        // Verify booking was saved with CANCELLED status (compensation)
+        verify(bookingRepository, atLeast(2)).save(any(Booking.class));
+    }
+
+    @Test
+    void createBooking_WhenRoomNotAvailable_ShouldCompensateAndThrow() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .build();
+
+        AvailabilityResponse notAvailableResponse = AvailabilityResponse.builder()
+                .roomId(1L)
+                .confirmed(false)
+                .message("Room already booked for these dates")
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking b = inv.getArgument(0);
+            b.setId(1L);
+            return b;
+        });
+        when(hotelServiceCaller.confirmAvailability(eq(1L), any())).thenReturn(notAvailableResponse);
+
+        // When/Then
+        assertThatThrownBy(() -> bookingService.createBooking(1L, request))
+                .isInstanceOf(BookingException.class)
+                .hasMessageContaining("Room is not available");
+
+        // Verify compensation was attempted
+        verify(hotelServiceCaller).releaseRoom(eq(1L), any(ReleaseRoomRequest.class));
+    }
+
+    @Test
+    void createBooking_WhenCircuitBreakerOpen_ShouldThrowHotelServiceException() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking b = inv.getArgument(0);
+            b.setId(1L);
+            return b;
+        });
+
+        // Simulate circuit breaker open
+        when(hotelServiceCaller.confirmAvailability(eq(1L), any()))
+                .thenThrow(new HotelServiceException("Hotel service is unavailable. Please try again later.",
+                        new RuntimeException("CircuitBreaker 'hotelService' is OPEN")));
+
+        // When/Then
+        assertThatThrownBy(() -> bookingService.createBooking(1L, request))
+                .isInstanceOf(BookingException.class)
+                .hasMessageContaining("Hotel service is unavailable");
+    }
+
+    @Test
+    void createBooking_SuccessfulFlow_ShouldConfirmBooking() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .build();
+
+        AvailabilityResponse availabilityResponse = AvailabilityResponse.builder()
+                .roomId(1L)
+                .confirmed(true)
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking b = inv.getArgument(0);
+            if (b.getId() == null) b.setId(1L);
+            return b;
+        });
+        when(hotelServiceCaller.confirmAvailability(eq(1L), any())).thenReturn(availabilityResponse);
+        when(bookingMapper.toDto(any(Booking.class))).thenReturn(testBookingDto);
+
+        // When
+        BookingDto result = bookingService.createBooking(1L, request);
+
+        // Then
+        assertThat(result).isNotNull();
+        verify(hotelServiceCaller).confirmAvailability(eq(1L), any());
+        verify(hotelServiceCaller).confirmBooking(eq(1L), any());
+        verify(hotelServiceCaller, never()).releaseRoom(anyLong(), any()); // No compensation
+    }
+
+    @Test
+    void createBooking_WhenConfirmBookingFails_ShouldStillSucceed() {
+        // Given - confirmBooking is non-critical, booking should still succeed
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .build();
+
+        AvailabilityResponse availabilityResponse = AvailabilityResponse.builder()
+                .roomId(1L)
+                .confirmed(true)
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking b = inv.getArgument(0);
+            if (b.getId() == null) b.setId(1L);
+            return b;
+        });
+        when(hotelServiceCaller.confirmAvailability(eq(1L), any())).thenReturn(availabilityResponse);
+        doThrow(new RuntimeException("Network error")).when(hotelServiceCaller).confirmBooking(anyLong(), any());
+        when(bookingMapper.toDto(any(Booking.class))).thenReturn(testBookingDto);
+
+        // When
+        BookingDto result = bookingService.createBooking(1L, request);
+
+        // Then - booking should still succeed
+        assertThat(result).isNotNull();
+        verify(hotelServiceCaller).confirmBooking(eq(1L), any()); // Was attempted
+    }
+
+    @Test
+    void cancelBooking_WhenReleaseRoomFails_ShouldStillCancelBooking() {
+        // Given
+        testBooking.setStatus(BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdAndUserId(1L, 1L)).thenReturn(Optional.of(testBooking));
+        when(bookingRepository.save(any(Booking.class))).thenAnswer(inv -> inv.getArgument(0));
+        doThrow(new RuntimeException("Network error")).when(hotelServiceCaller).releaseRoom(anyLong(), any());
+
+        // When
+        bookingService.cancelBooking(1L, 1L);
+
+        // Then - booking should still be cancelled locally
+        assertThat(testBooking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verify(bookingRepository).save(testBooking);
+    }
+
+    @Test
+    void createBooking_WithoutRoomId_AndAutoSelectFalse_ShouldThrowException() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .hotelId(1L)
+                .startDate(LocalDate.now().plusDays(1))
+                .endDate(LocalDate.now().plusDays(3))
+                .autoSelect(false)
+                // roomId is null
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+        when(userRepository.findById(1L)).thenReturn(Optional.of(testUser));
+
+        // When/Then
+        assertThatThrownBy(() -> bookingService.createBooking(1L, request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Room ID is required when autoSelect is false");
+    }
+
+    @Test
+    void createBooking_WithNullDates_ShouldThrowException() {
+        // Given
+        CreateBookingRequest request = CreateBookingRequest.builder()
+                .roomId(1L)
+                .hotelId(1L)
+                .startDate(null)
+                .endDate(null)
+                .build();
+
+        when(bookingRepository.findByRequestId(any())).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> bookingService.createBooking(1L, request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Start date and end date are required");
     }
 }

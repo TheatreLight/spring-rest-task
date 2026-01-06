@@ -1,14 +1,11 @@
 package com.hotel.bookingservice.service;
 
-import com.hotel.bookingservice.client.HotelServiceClient;
 import com.hotel.bookingservice.dto.*;
 import com.hotel.bookingservice.entity.*;
 import com.hotel.bookingservice.exception.*;
 import com.hotel.bookingservice.mapper.BookingMapper;
 import com.hotel.bookingservice.repository.BookingRepository;
 import com.hotel.bookingservice.repository.UserRepository;
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
-import io.github.resilience4j.retry.annotation.Retry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -27,7 +24,7 @@ public class BookingService {
 
     private final BookingRepository bookingRepository;
     private final UserRepository userRepository;
-    private final HotelServiceClient hotelServiceClient;
+    private final HotelServiceCaller hotelServiceCaller;
     private final BookingMapper bookingMapper;
 
     @Transactional(readOnly = true)
@@ -77,7 +74,7 @@ public class BookingService {
         // Get room info if hotelId not provided
         if (hotelId == null) {
             try {
-                RoomDto room = hotelServiceClient.getRoomById(roomId);
+                RoomDto room = hotelServiceCaller.getRoomById(roomId);
                 hotelId = room.getHotelId();
             } catch (Exception e) {
                 log.warn("Could not fetch room info: {}", e.getMessage());
@@ -100,7 +97,11 @@ public class BookingService {
 
         // Step 2: Confirm availability with Hotel Service (with retry and circuit breaker)
         try {
-            confirmRoomAvailability(booking, requestId);
+            AvailabilityResponse response = confirmRoomAvailability(booking, requestId);
+
+            if (!response.isConfirmed()) {
+                throw new BookingException("Room is not available for the requested dates");
+            }
 
             // Step 3: Update booking status to CONFIRMED
             booking.confirm();
@@ -143,7 +144,7 @@ public class BookingService {
                     .requestId(requestId)
                     .bookingId(bookingId)
                     .build();
-            hotelServiceClient.releaseRoom(booking.getRoomId(), releaseRequest);
+            hotelServiceCaller.releaseRoom(booking.getRoomId(), releaseRequest);
             log.info("Room {} released for booking {}", booking.getRoomId(), bookingId);
         } catch (Exception e) {
             log.warn("Failed to release room for booking {}: {}", bookingId, e.getMessage());
@@ -170,7 +171,7 @@ public class BookingService {
             log.debug("Auto-selecting room for hotel {} and dates {} - {}",
                     request.getHotelId(), request.getStartDate(), request.getEndDate());
 
-            List<RoomDto> recommendedRooms = hotelServiceClient.getRecommendedRooms(
+            List<RoomDto> recommendedRooms = hotelServiceCaller.getRecommendedRooms(
                     request.getHotelId(),
                     request.getStartDate(),
                     request.getEndDate());
@@ -190,9 +191,7 @@ public class BookingService {
         return request.getRoomId();
     }
 
-    @CircuitBreaker(name = "hotelService", fallbackMethod = "confirmAvailabilityFallback")
-    @Retry(name = "hotelService")
-    private void confirmRoomAvailability(Booking booking, String requestId) {
+    private AvailabilityResponse confirmRoomAvailability(Booking booking, String requestId) {
         log.debug("Confirming availability for room {} with requestId {}", booking.getRoomId(), requestId);
 
         ConfirmAvailabilityRequest confirmRequest = ConfirmAvailabilityRequest.builder()
@@ -202,26 +201,12 @@ public class BookingService {
                 .bookingId(booking.getId())
                 .build();
 
-        AvailabilityResponse response = hotelServiceClient.confirmAvailability(
-                booking.getRoomId(), confirmRequest);
-
-        if (!response.isConfirmed()) {
-            throw new BookingException("Room is not available for the requested dates");
-        }
-
-        log.debug("Room {} availability confirmed for dates {} - {}",
-                booking.getRoomId(), booking.getStartDate(), booking.getEndDate());
+        return hotelServiceCaller.confirmAvailability(booking.getRoomId(), confirmRequest);
     }
 
-    private void confirmAvailabilityFallback(Booking booking, String requestId, Exception e) {
-        log.error("Circuit breaker fallback for confirmAvailability: {}", e.getMessage());
-        throw new HotelServiceException("Hotel service is unavailable. Please try again later.", e);
-    }
-
-    @Retry(name = "hotelService")
     private void confirmBookingWithHotelService(Long roomId, String requestId) {
         try {
-            hotelServiceClient.confirmBooking(roomId, requestId);
+            hotelServiceCaller.confirmBooking(roomId, requestId);
         } catch (Exception e) {
             log.warn("Failed to confirm booking with hotel service: {}", e.getMessage());
             // Non-critical - booking is already confirmed
@@ -229,7 +214,7 @@ public class BookingService {
     }
 
     @Transactional
-    private void compensateBooking(Booking booking, String requestId) {
+    protected void compensateBooking(Booking booking, String requestId) {
         log.info("Compensating booking {} with requestId {}", booking.getId(), requestId);
 
         // Update booking status to CANCELLED
@@ -242,7 +227,7 @@ public class BookingService {
                     .requestId(requestId)
                     .bookingId(booking.getId())
                     .build();
-            hotelServiceClient.releaseRoom(booking.getRoomId(), releaseRequest);
+            hotelServiceCaller.releaseRoom(booking.getRoomId(), releaseRequest);
             log.info("Room {} released as part of compensation", booking.getRoomId());
         } catch (Exception e) {
             log.error("Failed to release room during compensation: {}", e.getMessage());
