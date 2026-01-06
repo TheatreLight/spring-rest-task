@@ -1,0 +1,51 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: booking-service
+          uri: lb://booking-service
+          predicates:
+            - Path=/api/bookings/**, /api/users/**, /booking/**, /bookings/**, /user/**
+          filters:
+            - RewritePath=/api/bookings/(?<segment>.*), /booking/${segment}
+            - RewritePath=/api/users/(?<segment>.*), /user/${segment}
+
+        - id: hotel-service
+          uri: lb://hotel-service
+          predicates:
+            - Path=/api/hotels/**, /api/rooms/**
+          filters:
+            - RewritePath=/api/(?<segment>.*), /api/${segment}
+
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
+  endpoint:
+    gateway:
+      enabled: true
+
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG
+    com.hotel.gateway: DEBUG
